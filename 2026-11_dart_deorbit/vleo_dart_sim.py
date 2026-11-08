@@ -111,7 +111,7 @@ MATERIALS = {
     "titanium": dict(rho=4430, c=560,  eps=0.40, T_fail=1878, H=3.7e5, label="Ti-6Al-4V (melts ~1600 °C)"),
     "steel":    dict(rho=8000, c=500,  eps=0.40, T_fail=1673, H=2.7e5, label="stainless steel (melts ~1400 °C)"),
 }
-MAT_COLORS = {"balsa": "tab:brown", "g10": "tab:olive", "aluminium": "tab:gray",
+MAT_COLORS = {"balsa": "tab:brown", "g10": "tab:olive", "fr4": "tab:green", "aluminium": "tab:gray",
               "titanium": "tab:purple", "steel": "k"}
 
 SOLAR = {  # name: (F10.7, F10.7a, Ap)
@@ -1152,7 +1152,7 @@ def cmd_video(args):
         """Material colour when cold, fading into the inferno heat colour as it warms."""
         w = float(np.clip((T - 330) / 350, 0, 1))
         return tuple(np.array(mcolors.to_rgb(base)) * (1 - w) + np.array(cmap(tnorm(T))[:3]) * w)
-    fin_base = {"balsa": "#d9b77e", "g10": "#b7c46a", "aluminium": "#b8bec8",
+    fin_base = {"balsa": "#d9b77e", "g10": "#b7c46a", "fr4": "#b7c46a", "aluminium": "#b8bec8",
                 "titanium": "#9c95b0", "steel": "#8c9198"}[R.material]
 
     # indicator text + fin bar
