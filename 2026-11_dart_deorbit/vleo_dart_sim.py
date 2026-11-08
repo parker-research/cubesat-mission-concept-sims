@@ -23,10 +23,10 @@ Subcommands
 
 Examples
 --------
-  uv run dart_vleo.py render
-  uv run dart_vleo.py run --mass 0.1 --release-alt 500 --aoa0 90
-  uv run dart_vleo.py plot
-  uv run dart_vleo.py survey --mass 1.0
+  uv run vleo_dart_sim.py render
+  uv run vleo_dart_sim.py run --mass 0.1 --release-alt 500 --aoa0 90
+  uv run vleo_dart_sim.py plot
+  uv run vleo_dart_sim.py survey --mass 1.0
 
 Model (deliberately rough)
 --------------------------
