@@ -8,15 +8,19 @@
 # ]
 # ///
 """
-Rough simulation of a finned "lawn dart" in very low Earth orbit (VLEO) and
-through reentry, using NRLMSIS 2.0 (via pymsis) for the atmosphere, with a
+Rough 6-DOF simulation of a finned "lawn dart" in very low Earth orbit (VLEO)
+and through reentry, using NRLMSIS 2.0 (via pymsis) for the atmosphere, with a
 coupled aerothermal model of the fins.
+
+(vleo_dart_sim_v1.py is the earlier planar, pitch-only version.)
 
 Subcommands
 -----------
   render   Draw the dart geometry (3D view, dimensioned side view, front view).
   survey   Fixed-altitude attitude runs, aero vs gravity-gradient stiffness,
            orbit-averaged lifetime, and a reentry from 140 km.
+  mc       Monte Carlo over release attitude and tip-off rates: attitude
+           histories at fixed starting altitudes, plus (optionally) reentries.
   run      Continuous orbit + attitude + fin-thermal run from release to the
            ground (saves every integrator step to an .npz file).
   plot     Overview, attitude-snapshot and heating figures from a run file.
@@ -27,27 +31,36 @@ Examples
 --------
   uv run vleo_dart_sim.py render
   uv run vleo_dart_sim.py run --mass 0.1 --release-alt 500 --aoa0 90 --fin-material balsa
+  uv run vleo_dart_sim.py run --incl 51.6 --aoa0 60 --yaw0 20 --roll0 10 --rates0 1 -2 0.5
+  uv run vleo_dart_sim.py mc --alts 500 300 200 --n 32 --tipoff 2
   uv run vleo_dart_sim.py plot
   uv run vleo_dart_sim.py video
   uv run vleo_dart_sim.py --out results all
 
 Model (deliberately rough)
 --------------------------
-  * Planar: equatorial prograde orbit, attitude = pitch only (rotation about
-    the orbit normal). Spherical Earth, point-mass gravity + gravity-gradient
-    torque. Atmosphere co-rotates with the Earth.
-  * Atmosphere: NRLMSIS 2.0 tabulated vs altitude and local solar time
-    (equator, 2026-11-07) for a chosen solar/geomagnetic activity level.
+  * 6-DOF: 3D translation in an Earth-centred inertial frame (any
+    inclination) and full rigid-body attitude (quaternion + body rates,
+    Euler's equations with an axisymmetric inertia tensor, so gyroscopic
+    coupling is included). Spherical Earth, point-mass gravity + full
+    gravity-gradient torque vector. Atmosphere co-rotates with the Earth.
+  * Atmosphere: NRLMSIS 2.0 tabulated vs altitude, latitude and local solar
+    time (2026-11-07) for a chosen solar/geomagnetic activity level.
   * Aerodynamics:
       - Free-molecular: Sentman diffuse-reflection panel model (full
         accommodation, 300 K wall), including thermal motion, on a faceted
         cone-cylinder with 4 cruciform 3 mm thick fins (faces + blunt
         leading/trailing edges).
-      - Continuum: Barrowman-style normal-force build-up (nose + fins + body
-        crossflow), Mach-dependent axial drag, blunt fin leading-edge drag.
+      - Continuum: Barrowman-style normal-force build-up (nose + body
+        crossflow in the total-angle-of-attack plane, each fin as its own
+        lifting surface), Mach-dependent axial drag, blunt fin leading-edge
+        drag.
       - Transitional: blended by Knudsen number (Kn 0.01 .. 10).
-      - Local velocity at each panel includes omega x r, so aerodynamic
-        pitch damping emerges naturally. No shadowing between panels.
+      - Local velocity at each panel includes omega x r, so pitch, yaw and
+        roll damping emerge naturally. No shadowing between panels.
+      - Optional fin cant (--fin-cant) gives a roll-driving torque. Beware:
+        the equilibrium spin rate is ~ cant * V / fin radius, i.e. hundreds
+        to thousands of rad/s at orbital speed, which makes long runs slow.
   * Heating:
       - Free-molecular: incident energy flux per panel (full energy
         accommodation), including thermal motion.
@@ -60,9 +73,17 @@ Model (deliberately rough)
         consumes fin material (effective heat of ablation). Lost fin area is
         fed back into the aerodynamics. Total vehicle mass is held constant.
       - Nose: radiative-equilibrium temperature only (no material response).
-  * Attitude convention: aoa = angle from relative wind to nose, positive
-    counter-clockwise. In the (counter-clockwise) orbit, aoa = +90 is nadir,
-    -90 is zenith, 0 is nose into the wind.
+  * Initial attitude: the release frame is local-horizontal (along-track,
+    nadir, orbit normal). --aoa0 pitches the nose in the orbit plane
+    (+90 = nadir, -90 = zenith, 0 = prograde), then --yaw0 tilts it out of
+    plane toward the orbit normal, then --roll0 rolls about the nose. The
+    dart starts rotating with the local vertical, plus --rates0 (body
+    p, q, r tip-off rates, deg/s).
+  * Reported angles: aoa_total = angle between nose and relative wind
+    (0..180); aoa = signed angle in the vertical plane through the wind
+    (+ = nose down, as in v1); beta = nose angle out of that plane (+ toward
+    the left of the wind direction / the orbit normal for a prograde orbit);
+    nose_elev = nose elevation above the local horizon (-90 = straight down).
 """
 from __future__ import annotations
 
@@ -130,40 +151,48 @@ def solar_label(name):
 # Atmosphere
 # =============================================================================
 class Atmosphere:
-    """NRLMSIS table vs altitude x longitude (= local solar time at fixed UTC;
-    with the Sun ~fixed in inertial space, the satellite's inertial angle maps
-    onto this longitude axis)."""
+    """NRLMSIS table vs latitude x longitude x altitude. Longitude stands in
+    for local solar time at a fixed UTC: with the Sun ~fixed in inertial
+    space, the satellite's inertial right ascension maps onto this axis."""
 
-    def __init__(self, f107, f107a, ap, dh=1.0, dlon=10.0):
+    _cache = {}
+
+    def __init__(self, f107, f107a, ap, dh=1.0, dlon=10.0, dlat=10.0):
         self.alts = np.arange(0, 1000 + dh, dh)
         self.lons = np.arange(0, 360 + dlon, dlon)
-        self.dh, self.dlon = dh, dlon
-        out = pymsis.calculate(DATE, self.lons, np.array([0.0]), self.alts,
+        self.lats = np.arange(-90, 90 + dlat, dlat)
+        self.dh, self.dlon, self.dlat = dh, dlon, dlat
+        out = pymsis.calculate(DATE, self.lons, self.lats, self.alts,
                                f107s=f107, f107as=f107a, aps=[[ap] * 7])
-        out = out[0, :, 0, :, :]            # (nlon, nalt, 11)
+        out = out[0]                        # (nlon, nlat, nalt, 11)
         self.logrho = np.log(out[..., 0])
         self.logn = np.log(np.nansum(out[..., 1:10], axis=-1))
         self.T = out[..., 10]
+        # one stacked table so a lookup is a single gather
+        self._tab = np.stack([self.logrho, self.logn, self.T], axis=-1)
 
     @classmethod
     def named(cls, name):
-        return cls(*SOLAR[name])
+        if name not in cls._cache:
+            cls._cache[name] = cls(*SOLAR[name])
+        return cls._cache[name]
 
-    def __call__(self, h_km, lon_deg):
+    def __call__(self, h_km, lat_deg, lon_deg):
         h = min(max(h_km, 0.0), self.alts[-1] - 1e-6)
-        lo = lon_deg % 360.0
-        fi, fj = h / self.dh, lo / self.dlon
-        i, j = int(fi), int(fj)
-        a, b = fi - i, fj - j
+        fi = h / self.dh
+        fj = (lon_deg % 360.0) / self.dlon
+        fk = (min(max(lat_deg, -90.0), 90.0 - 1e-9) + 90.0) / self.dlat
+        i, j, k = int(fi), int(fj), int(fk)
+        a, b, c = fi - i, fj - j, fk - k
+        t = self._tab
+        v = ((1 - b) * ((1 - c) * ((1 - a) * t[j, k, i] + a * t[j, k, i + 1])
+                        + c * ((1 - a) * t[j, k + 1, i] + a * t[j, k + 1, i + 1]))
+             + b * ((1 - c) * ((1 - a) * t[j + 1, k, i] + a * t[j + 1, k, i + 1])
+                    + c * ((1 - a) * t[j + 1, k + 1, i] + a * t[j + 1, k + 1, i + 1])))
+        return np.exp(v[0]), np.exp(v[1]), v[2]
 
-        def bil(tab):
-            return ((1 - a) * (1 - b) * tab[j, i] + a * (1 - b) * tab[j, i + 1]
-                    + (1 - a) * b * tab[j + 1, i] + a * b * tab[j + 1, i + 1])
-
-        return np.exp(bil(self.logrho)), np.exp(bil(self.logn)), bil(self.T)
-
-    def mean_profile(self):
-        rho = np.exp(self.logrho)
+    def mean_profile(self, lat=0.0):
+        rho = np.exp(self.logrho[:, int(round((lat + 90) / self.dlat)), :])
         return self.alts, rho.mean(0), rho.min(0), rho.max(0)
 
 
@@ -172,10 +201,13 @@ class Atmosphere:
 # =============================================================================
 class Dart:
     """0.5 m x 50 mm cone-cylinder dart, CG 0.20 m behind tip, four 80 x 100 mm
-    x 3 mm tail fins. Body frame: x toward nose, origin at CG."""
+    x 3 mm tail fins. Body frame: x toward nose, origin at CG. fin_cant_deg
+    rotates every fin about its own outward span axis (same sense on all
+    four, so it drives roll)."""
 
-    def __init__(self, m=0.1, fin_t=0.003, nose_r=0.003):
+    def __init__(self, m=0.1, fin_t=0.003, nose_r=0.003, fin_cant_deg=0.0):
         self.m = m
+        self.fin_cant = np.radians(fin_cant_deg)
         self.L, self.D = 0.50, 0.05
         self.r = self.D / 2
         self.Lc = 0.10
@@ -187,6 +219,7 @@ class Dart:
         self.A_ref = np.pi * self.r ** 2
         self.I_t = self.m * self.L ** 2 / 12 + self.m * (self.L / 2 - self.x_tip) ** 2
         self.I_a = 0.5 * self.m * self.r ** 2
+        self.I = np.array([self.I_a, self.I_t, self.I_t])   # principal inertias (axisymmetric)
         s, c, t = self.fin_span, self.fin_chord, fin_t
         self.A_face = s * c
         self.A_le_total = 4 * s * t
@@ -231,18 +264,26 @@ class Dart:
                     2 * np.pi * self.r * segL / nf)
         add([self.x_tail, 0, 0], [-1, 0, 0], np.pi * self.r ** 2)  # base
         # 4 fins: two faces + blunt leading edge + trailing edge each.
-        # Fins spanning +/-z have face normals +/-y (pitch-active).
+        # Fins spanning +/-z have face normals +/-y (pitch-active), fins
+        # spanning +/-y have normals +/-z (yaw-active). Cant rotates each fin
+        # about its outward span axis.
         s, c, t = self.fin_span, self.fin_chord, self.fin_t
         xf = self.x_tail + c / 2
         off = self.r + s / 2
-        for span_dir, nrm in (([0, 0, 1], [0, 1, 0]), ([0, 0, -1], [0, 1, 0]),
-                              ([0, 1, 0], [0, 0, 1]), ([0, -1, 0], [0, 0, 1])):
-            ctr = np.array([xf, 0, 0]) + off * np.array(span_dir)
-            nrm = np.array(nrm, float)
+        self.fin_cp, self.fin_n, self.fin_e = [], [], []
+        for span_dir, nrm in (([0, 0, 1], [0, 1, 0]), ([0, 0, -1], [0, -1, 0]),
+                              ([0, 1, 0], [0, 0, -1]), ([0, -1, 0], [0, 0, 1])):
+            e = np.array(span_dir, float)
+            Rc = axis_angle(e, self.fin_cant)
+            ctr = np.array([xf, 0, 0]) + off * e
+            nrm = Rc @ np.array(nrm, float)
+            xax = Rc @ np.array([1.0, 0, 0])
+            self.fin_cp.append(ctr); self.fin_n.append(nrm); self.fin_e.append(e)
             for sgn in (1, -1):
                 add(ctr + sgn * nrm * t / 2, sgn * nrm, s * c, True)
-            add(ctr + [c / 2, 0, 0], [1, 0, 0], s * t, True)    # leading edge
-            add(ctr - [c / 2, 0, 0], [-1, 0, 0], s * t, True)   # trailing edge
+            add(ctr + xax * c / 2, xax, s * t, True)      # leading edge
+            add(ctr - xax * c / 2, -xax, s * t, True)     # trailing edge
+        self.fin_cp, self.fin_n, self.fin_e = map(np.array, (self.fin_cp, self.fin_n, self.fin_e))
         self.P_r = np.array(P_r, float)
         self.P_n = np.array(P_n, float)
         self.P_A = np.array(P_A, float)
@@ -287,8 +328,9 @@ def fm_weight(n, Lref=0.5):
 
 def free_molecular(dart, v_body, omega, rho, n, T, scale):
     """Sentman forces/torque and incident energy flux per panel (body frame).
-    scale = remaining fraction of fin material (scales fin panel areas)."""
-    vloc = v_body + np.cross([0.0, 0.0, omega], dart.P_r)
+    omega = body angular-velocity vector; scale = remaining fraction of fin
+    material (scales fin panel areas). Returns force, torque vector, heat."""
+    vloc = v_body + np.cross(omega, dart.P_r)
     V = np.linalg.norm(vloc, axis=1)
     uD = -vloc / V[:, None]
     m_mol = rho / n
@@ -306,35 +348,42 @@ def free_molecular(dart, v_body, omega, rho, n, T, scale):
     F = (q * A)[:, None] * (cD[:, None] * uD + (G * Z)[:, None] * (-nrm - g[:, None] * uD)
                             - reem[:, None] * nrm)
     heat = 0.5 * (g * Z + P / np.sqrt(np.pi)) * 0.5 * rho * V ** 3 * A   # W per panel
-    return F.sum(0), np.cross(dart.P_r, F)[:, 2].sum(), heat
+    return F.sum(0), np.cross(dart.P_r, F).sum(0), heat
 
 
 def continuum_forces(dart, v_body, omega, rho, n, T, scale):
+    """Continuum forces and torque vector (body frame). Nose and body
+    crossflow act in the total-angle-of-attack plane; each fin is its own
+    lifting surface seeing its local flow (incl. omega x r), so pitch/yaw
+    damping, roll damping and canted-fin roll torque all come out of it.
+    In planar flight with no cant this reduces exactly to the v1 model."""
     a_snd = np.sqrt(1.4 * KB * T / (rho / n))
     F = np.zeros(3)
-    tau = 0.0
+    tau = np.zeros(3)
 
-    def local(x):
-        vl = v_body + np.cross([0, 0, omega], [x, 0, 0])
+    def local(p):
+        vl = v_body + np.cross(omega, p)
         V = np.linalg.norm(vl)
-        u = -vl / V
-        return V, np.arctan2(u[1], -u[0]), u
+        return V, -vl / V          # speed, unit vector of the oncoming air (body frame)
 
-    V, al, u = local(0.0)  # axial drag: body + blunt fin leading edges
+    V, u = local(np.zeros(3))  # axial drag: body + blunt fin leading edges
     M = V / a_snd
     q = 0.5 * rho * V ** 2
     F[0] += q * (dart.A_ref * cd0_axial(M) + scale * dart.A_le_total * cd_fin_le(M)) * np.sign(u[0])
-    V, al, u = local(dart.x_nose_cp)  # nose (slender body CNa = 2)
-    fy = 0.5 * rho * V ** 2 * dart.A_ref * 2 * np.sin(al) * np.cos(al)
-    F[1] += fy; tau += dart.x_nose_cp * fy
-    V, al, u = local(dart.x_cyl)  # body crossflow
-    fy = 0.5 * rho * V ** 2 * 1.2 * dart.D * dart.L_cyl * np.sin(al) * abs(np.sin(al))
-    F[1] += fy; tau += dart.x_cyl * fy
-    V, al, u = local(dart.x_fin)  # fins
-    cn = (dart.K_int * fin_cna(dart, V / a_snd) * np.sin(al) * np.cos(al)
-          + 1.28 * np.sin(al) * abs(np.sin(al)))
-    fy = 0.5 * rho * V ** 2 * dart.A_fin_pair * scale * cn
-    F[1] += fy; tau += dart.x_fin * fy
+    p = np.array([dart.x_nose_cp, 0, 0])  # nose (slender body CNa = 2): sin*cos with sin = |u_perp|
+    V, u = local(p)
+    f = 0.5 * rho * V ** 2 * dart.A_ref * 2 * (-u[0]) * np.array([0, u[1], u[2]])
+    F += f; tau += np.cross(p, f)
+    p = np.array([dart.x_cyl, 0, 0])  # body crossflow, sin*|sin|
+    V, u = local(p)
+    f = 0.5 * rho * V ** 2 * 1.2 * dart.D * dart.L_cyl * np.hypot(u[1], u[2]) * np.array([0, u[1], u[2]])
+    F += f; tau += np.cross(p, f)
+    for p, nrm in zip(dart.fin_cp, dart.fin_n):  # fins, one at a time
+        V, u = local(p)
+        s, c = u @ nrm, -u[0]
+        cn = dart.K_int * fin_cna(dart, V / a_snd) * s * c + 1.28 * s * abs(s)
+        f = 0.5 * rho * V ** 2 * dart.A_face * scale * cn * nrm
+        F += f; tau += np.cross(p, f)
     return F, tau
 
 
@@ -342,7 +391,7 @@ def continuum_heating(dart, v_body, rho, T, scale):
     """Continuum heat fluxes (W/m2) and powers (W), each capped at the
     free-stream kinetic energy flux."""
     V = np.linalg.norm(v_body)
-    alpha = np.arctan2(abs(v_body[1]), v_body[0])  # angle between nose and velocity
+    alpha = np.arctan2(np.hypot(v_body[1], v_body[2]), v_body[0])  # total angle, nose vs velocity
     qke = 0.5 * rho * V ** 3
     mu = sutherland_mu(T)
     q_nose = min(K_SG * np.sqrt(rho / dart.nose_r) * V ** 3, qke)
@@ -358,10 +407,11 @@ def continuum_heating(dart, v_body, rho, T, scale):
 
 
 def aerothermal(dart, v_body, omega, rho, n, T, scale=1.0, heat=True):
-    """Blended forces (body frame), pitch torque, and (optionally) heating."""
+    """Blended forces and torque vector (body frame), and (optionally)
+    heating. omega is the body angular-velocity vector."""
     w = fm_weight(n, dart.L)
     w_fin = fm_weight(n, dart.fin_chord)
-    F = np.zeros(3); tau = 0.0
+    F = np.zeros(3); tau = np.zeros(3)
     need_fm = w > 0 or (heat and w_fin > 0)
     if need_fm:
         f_fm, t_fm, h_fm = free_molecular(dart, v_body, omega, rho, n, T, scale)
@@ -405,71 +455,166 @@ def fin_thermal_rates(dart, mat, Tf, f, P_in):
 # Dynamics
 # =============================================================================
 def rot(a):
+    """Rotation about the body z (pitch) axis."""
     c, s = np.cos(a), np.sin(a)
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
 
+def axis_angle(e, a):
+    """Rotation matrix about unit vector e by angle a (Rodrigues)."""
+    e = np.asarray(e, float)
+    K = np.array([[0, -e[2], e[1]], [e[2], 0, -e[0]], [-e[1], e[0], 0]])
+    return np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * K @ K
+
+
+def quat_dcm(q):
+    """Body -> inertial rotation matrix from quaternion [w, x, y, z]
+    (normalised here, so slow norm drift does not matter)."""
+    w, x, y, z = q / np.sqrt(q @ q)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                     [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+def dcm_quat(C):
+    """Quaternion [w, x, y, z] from a body -> inertial rotation matrix."""
+    tr = np.trace(C)
+    if tr > 0:
+        s = 2 * np.sqrt(tr + 1)
+        q = [0.25 * s, (C[2, 1] - C[1, 2]) / s, (C[0, 2] - C[2, 0]) / s, (C[1, 0] - C[0, 1]) / s]
+    else:
+        i = int(np.argmax(np.diag(C)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = 2 * np.sqrt(1 + C[i, i] - C[j, j] - C[k, k])
+        q = np.zeros(4)
+        q[0] = (C[k, j] - C[j, k]) / s
+        q[1 + i] = 0.25 * s
+        q[1 + j] = (C[j, i] + C[i, j]) / s
+        q[1 + k] = (C[k, i] + C[i, k]) / s
+    q = np.array(q, float)
+    return q / np.linalg.norm(q)
+
+
+def quat_dot(q, w):
+    """dq/dt for body rates w: 0.5 * q (x) [0, w]."""
+    q0, q1, q2, q3 = q
+    wx, wy, wz = w
+    return 0.5 * np.array([-q1 * wx - q2 * wy - q3 * wz,
+                           q0 * wx + q2 * wz - q3 * wy,
+                           q0 * wy + q3 * wx - q1 * wz,
+                           q0 * wz + q1 * wy - q2 * wx])
+
+
+# State layout: [r(3), v(3), quaternion(4), body rates(3), T_fin, fin_consumed_fraction]
+NSTATE = 15
+I_R, I_V, I_Q, I_W, I_TF, I_F = slice(0, 3), slice(3, 6), slice(6, 10), slice(10, 13), 13, 14
+EARTH_W = np.array([0.0, 0.0, WE])
+
+
 def local_state(dart, atm, y):
     """Atmosphere + body-frame relative velocity for one state vector."""
-    X, Y, VX, VY, psi, om = y[:6]
-    rn = np.hypot(X, Y)
-    rho, n, T = atm((rn - RE) / 1e3, np.degrees(np.arctan2(Y, X)))
-    v_rel = np.array([VX + WE * Y, VY - WE * X, 0.0])
-    return rho, n, T, rot(psi).T @ v_rel
+    r = y[I_R]
+    rn = np.sqrt(r @ r)
+    rho, n, T = atm((rn - RE) / 1e3, np.degrees(np.arcsin(r[2] / rn)), np.degrees(np.arctan2(r[1], r[0])))
+    v_rel = y[I_V] - np.cross(EARTH_W, r)
+    return rho, n, T, quat_dcm(y[I_Q]).T @ v_rel
 
 
 def make_rhs(dart, atm, material="balsa"):
-    """State: [X, Y, VX, VY, psi, omega, T_fin, fin_consumed_fraction]."""
+    """6-DOF + fin thermal right-hand side (state layout above)."""
     mat = MATERIALS[material]
+    I = dart.I
 
     def rhs(t, y):
-        X, Y, VX, VY, psi, om, Tf, f = y
-        f = min(max(f, 0.0), 1.0)
-        r = np.array([X, Y, 0.0]); rn = np.linalg.norm(r)
+        r, q, w = y[I_R], y[I_Q], y[I_W]
+        f = min(max(y[I_F], 0.0), 1.0)
+        rn = np.sqrt(r @ r)
         rho, n, T, v_b = local_state(dart, atm, y)
-        Rb = rot(psi)
-        Fb, tau, H = aerothermal(dart, v_b, om, rho, n, T, 1.0 - f, heat=True)
-        acc = -MU * r / rn ** 3 + (Rb @ Fb) / dart.m
-        r_b = Rb.T @ r
-        tau_gg = 3 * MU / rn ** 5 * r_b[0] * r_b[1] * (dart.I_t - dart.I_a)
-        dT, df = fin_thermal_rates(dart, mat, Tf, f, H["P_fins"])
-        return [VX, VY, acc[0], acc[1], om, (tau + tau_gg) / dart.I_t, dT, df]
+        C = quat_dcm(q)
+        Fb, tau, H = aerothermal(dart, v_b, w, rho, n, T, 1.0 - f, heat=True)
+        acc = -MU * r / rn ** 3 + (C @ Fb) / dart.m
+        r_b = C.T @ r
+        tau_gg = 3 * MU / rn ** 5 * np.cross(r_b, I * r_b)
+        w_dot = (tau + tau_gg - np.cross(w, I * w)) / I
+        dT, df = fin_thermal_rates(dart, mat, y[I_TF], f, H["P_fins"])
+        out = np.empty(NSTATE)
+        out[I_R] = y[I_V]; out[I_V] = acc; out[I_Q] = quat_dot(q, w); out[I_W] = w_dot
+        out[I_TF] = dT; out[I_F] = df
+        return out
     return rhs
 
 
-ATOL = [1e-1, 1e-1, 1e-4, 1e-4, 1e-8, 1e-10, 1e-3, 1e-9]
+ATOL = np.array([1e-1] * 3 + [1e-4] * 3 + [1e-9] * 4 + [1e-10] * 3 + [1e-3, 1e-9])
 
 
 def ground_event(t, y):
-    return np.hypot(y[0], y[1]) - RE
+    return np.sqrt(y[0] ** 2 + y[1] ** 2 + y[2] ** 2) - RE
 ground_event.terminal = True
 
 
-def circ_state(h_km, aoa0_deg):
-    """Circular orbit at h_km, nose at aoa0 from the wind, rotating with the
-    local vertical, fins intact at T_FIN0. Returns (state, orbital period)."""
+def circ_state(h_km, aoa0_deg, incl_deg=0.0, yaw0_deg=0.0, roll0_deg=0.0, rates0_dps=(0.0, 0.0, 0.0)):
+    """Circular orbit at h_km (starting at the ascending node), nose pitched
+    aoa0 in the orbit plane (+ = toward nadir), then yawed yaw0 out of plane
+    toward the orbit normal, then rolled roll0 about the nose. Rotating with
+    the local vertical plus body tip-off rates (deg/s); fins intact at
+    T_FIN0. Returns (state, orbital period)."""
     r = RE + h_km * 1e3
     v = np.sqrt(MU / r)
     n = v / r
-    return [r, 0.0, 0.0, v, np.pi / 2 + np.radians(aoa0_deg), n, T_FIN0, 0.0], 2 * np.pi / n
+    i = np.radians(incl_deg)
+    up = np.array([1.0, 0, 0])
+    along = np.array([0, np.cos(i), np.sin(i)])
+    normal = np.cross(up, along)
+    B0 = np.column_stack([along, -up, normal])       # x prograde, y nadir, z orbit normal
+    C = (B0 @ axis_angle([0, 0, 1], np.radians(aoa0_deg)) @ axis_angle([0, 1, 0], -np.radians(yaw0_deg))
+         @ axis_angle([1, 0, 0], np.radians(roll0_deg)))
+    w_b = C.T @ (n * normal) + np.radians(np.asarray(rates0_dps, float))
+    y = np.concatenate([r * up, v * along, dcm_quat(C), w_b, [T_FIN0, 0.0]])
+    return y, 2 * np.pi / n
+
+
+def planar_to_6dof(y8):
+    """Convert v1 planar states [X, Y, VX, VY, psi, omega, (T_fin, f)] to 6-DOF."""
+    y8 = np.atleast_2d(np.asarray(y8, float).T).T
+    m = y8.shape[1]
+    out = np.zeros((NSTATE, m))
+    out[0], out[1], out[3], out[4] = y8[0], y8[1], y8[2], y8[3]
+    out[6], out[9] = np.cos(y8[4] / 2), np.sin(y8[4] / 2)
+    out[12] = y8[5]
+    out[13] = y8[6] if y8.shape[0] > 6 else T_ENV
+    out[14] = y8[7] if y8.shape[0] > 7 else 0.0
+    return out
 
 
 def diagnostics(t, y):
-    X, Y, VX, VY, psi, om = y[:6]
-    rn = np.hypot(X, Y)
-    up = np.stack([X, Y]) / rn
-    hor = np.stack([-up[1], up[0]])
-    v = np.stack([VX + WE * Y, VY - WE * X])
-    nose = np.stack([np.cos(psi), np.sin(psi)])
-    vhat = v / np.linalg.norm(v, axis=0)
+    """Derived quantities for states y (NSTATE x N)."""
+    r, v, q, w = y[I_R], y[I_V], y[I_Q], y[I_W]
+    rn = np.linalg.norm(r, axis=0)
+    up = r / rn
+    v_rel = v - np.cross(EARTH_W[:, None], r, axis=0)
+    speed = np.linalg.norm(v_rel, axis=0)
+    vhat = v_rel / speed
+    q = q / np.linalg.norm(q, axis=0)
+    qw, qx, qy, qz = q
+    nose = np.stack([1 - 2 * (qy ** 2 + qz ** 2), 2 * (qx * qy + qw * qz), 2 * (qx * qz - qw * qy)])
+    dot = lambda a, b: (a * b).sum(0)
+    unit = lambda a: a / np.maximum(np.linalg.norm(a, axis=0), 1e-12)
+    e_h = unit(vhat - dot(vhat, up) * up)                 # horizontal, along the wind heading
+    e_upw = unit(up - dot(up, vhat) * vhat)               # 'up' in the plane normal to the wind
+    e_side = np.cross(e_upw, vhat, axis=0)                # left of the wind direction
     d = dict(
         t=t, h=(rn - RE) / 1e3,
-        nose_pitch=np.degrees(np.arctan2((nose * up).sum(0), (nose * hor).sum(0))),
-        fpa=np.degrees(np.arctan2((v * up).sum(0), (v * hor).sum(0))),
-        aoa=np.degrees(np.arctan2(vhat[0] * nose[1] - vhat[1] * nose[0], (vhat * nose).sum(0))),
-        speed=np.linalg.norm(v, axis=0))
-    if y.shape[0] >= 8:
-        d["T_fin"], d["fin_left"] = y[6], 1 - np.clip(y[7], 0, 1)
+        lat=np.degrees(np.arcsin(r[2] / rn)),
+        nose_elev=np.degrees(np.arcsin(np.clip(dot(nose, up), -1, 1))),
+        nose_pitch=np.degrees(np.arctan2(dot(nose, up), dot(nose, e_h))),
+        fpa=np.degrees(np.arcsin(np.clip(dot(vhat, up), -1, 1))),
+        aoa_total=np.degrees(np.arccos(np.clip(dot(nose, vhat), -1, 1))),
+        aoa=np.degrees(np.arctan2(-dot(nose, e_upw), dot(nose, vhat))),
+        beta=np.degrees(np.arcsin(np.clip(dot(nose, e_side), -1, 1))),
+        roll_rate=np.degrees(w[0]),
+        transverse_rate=np.degrees(np.hypot(w[1], w[2])),
+        speed=speed)
+    d["T_fin"], d["fin_left"] = y[I_TF], 1 - np.clip(y[I_F], 0, 1)
     return d
 
 
@@ -480,8 +625,8 @@ def sol_diag(sol):
 def state_props(dart, atm, y, material):
     """Everything the video/plots show for one state vector."""
     rho, n, T, v_b = local_state(dart, atm, y)
-    f = float(np.clip(y[7], 0, 1)) if len(y) >= 8 else 0.0
-    _, _, H = aerothermal(dart, v_b, y[5], rho, n, T, 1 - f, heat=True)
+    f = float(np.clip(y[I_F], 0, 1))
+    _, _, H = aerothermal(dart, v_b, y[I_W], rho, n, T, 1 - f, heat=True)
     V = np.linalg.norm(v_b)
     lam = 1 / (np.sqrt(2) * np.pi * D_MOL ** 2 * n)
     eps = MATERIALS[material]["eps"]
@@ -500,17 +645,18 @@ def stiffness_curve(dart, atm, hs):
     """Aero restoring stiffness about nose-into-wind (mean / night / day
     density) and gravity-gradient stiffness, N m/rad."""
     d = np.radians(1.0)
+    w0 = np.zeros(3)
     out = {"mean": [], "min": [], "max": [], "gg": []}
     for h in hs:
-        trip = [atm(h, lo) for lo in atm.lons[:-1]]
+        trip = [atm(h, 0.0, lo) for lo in atm.lons[:-1]]
         rhos = np.array([q[0] for q in trip])
         cases = {"mean": (rhos.mean(), np.mean([q[1] for q in trip]), np.mean([q[2] for q in trip])),
                  "min": trip[rhos.argmin()], "max": trip[rhos.argmax()]}
         r = RE + h * 1e3
         v = np.sqrt(MU / r) - WE * r
         for k, (rho, n, T) in cases.items():
-            tp = aero(dart, rot(-d) @ np.array([v, 0, 0]), 0.0, rho, n, T)[1]
-            tm = aero(dart, rot(d) @ np.array([v, 0, 0]), 0.0, rho, n, T)[1]
+            tp = aero(dart, rot(-d) @ np.array([v, 0, 0]), w0, rho, n, T)[1][2]
+            tm = aero(dart, rot(d) @ np.array([v, 0, 0]), w0, rho, n, T)[1][2]
             out[k].append(-(tp - tm) / (2 * d))
         out["gg"].append(3 * MU / r ** 3 * (dart.I_t - dart.I_a))
     out = {k: np.array(v) for k, v in out.items()}
@@ -526,7 +672,8 @@ def nose_first_lifetime(dart, atm, h_start, h_end=140.0):
     def a_drag(h):
         r = RE + h * 1e3
         v = np.sqrt(MU / r) - WE * r
-        tot = sum(np.linalg.norm(aero(dart, np.array([v, 0, 0]), 0.0, *atm(h, lo))[0]) for lo in lons)
+        tot = sum(np.linalg.norm(aero(dart, np.array([v, 0, 0]), np.zeros(3), *atm(h, 0.0, lo))[0])
+                  for lo in lons)
         return tot / len(lons) / dart.m
 
     hg = np.arange(h_end - 20, h_start + 2, 2.0)
@@ -566,7 +713,7 @@ def plot_stiffness(ax, hs, k, title, mark_alt=None):
 
 
 def plot_reentry(ax_a, ax_b, d, title_a, title_b):
-    ax_a.plot(d["nose_pitch"], d["h"], c="k", lw=0.4, alpha=0.6, label="nose pitch vs local horizon")
+    ax_a.plot(d["nose_elev"], d["h"], c="k", lw=0.4, alpha=0.6, label="nose elevation vs local horizon")
     ax_a.plot(d["fpa"], d["h"], c="tab:orange", lw=1.5, ls="--", label="flight path angle (rel. air)")
     ax_a.set_xlim(-100, 40)
     ax_a.set_xlabel("degrees (0 = horizontal, −90 = straight down)"); ax_a.set_ylabel("altitude (km)")
@@ -575,15 +722,15 @@ def plot_reentry(ax_a, ax_b, d, title_a, title_b):
     ax_b.set_xlim(0, 8000)
     ax_b.set_xlabel("speed relative to air (m/s)", color="tab:blue"); ax_b.set_ylabel("altitude (km)")
     tw = ax_b.twiny()
-    tw.plot(np.abs(d["aoa"]), d["h"], c="tab:red", lw=0.5, alpha=0.8)
-    tw.set_xlim(0, 60); tw.set_xlabel("|angle of attack| (deg)", color="tab:red")
+    tw.plot(d["aoa_total"], d["h"], c="tab:red", lw=0.5, alpha=0.8)
+    tw.set_xlim(0, 60); tw.set_xlabel("total angle of attack (deg)", color="tab:red")
     ax_b.set_title(title_b, pad=30); ax_b.grid(alpha=0.3)
 
 
 def footer(fig, dart, extra):
     fig.text(0.5, 0.005,
              f"Dart: 0.5 m × 50 mm cone-cylinder, {dart.m*1000:.0f} g, CG 0.20 m from tip, four 80×100 mm "
-             f"tail fins. {extra} Planar equatorial orbit, pitch only.", ha="center", fontsize=8, wrap=True)
+             f"tail fins. {extra} 6-DOF.", ha="center", fontsize=8, wrap=True)
 
 
 # =============================================================================
@@ -678,8 +825,13 @@ def cmd_render(args):
 # =============================================================================
 # Subcommand: survey (fixed-altitude study)
 # =============================================================================
+def release_kwargs(args):
+    """circ_state keyword arguments from the CLI release options."""
+    return dict(incl_deg=args.incl, yaw0_deg=args.yaw0, roll0_deg=args.roll0, rates0_dps=args.rates0)
+
+
 def cmd_survey(args):
-    dart = Dart(m=args.mass)
+    dart = Dart(m=args.mass, fin_cant_deg=args.fin_cant)
     atms = {k: Atmosphere.named(k) for k in SOLAR}
     atm = atms[args.solar]
     rhs = make_rhs(dart, atm, args.fin_material)
@@ -690,7 +842,7 @@ def cmd_survey(args):
 
     p1 = {}
     for h0 in args.alts:
-        y0, Torb = circ_state(h0, args.aoa0)
+        y0, Torb = circ_state(h0, args.aoa0, **release_kwargs(args))
         sol = solve_ivp(rhs, (0, args.orbits * Torb), y0, method="DOP853", rtol=1e-9, atol=ATOL, max_step=20)
         p1[h0] = (sol_diag(sol), Torb)
         print(f"attitude run at {h0} km done")
@@ -700,12 +852,12 @@ def cmd_survey(args):
         p2[name] = nose_first_lifetime(dart, a, args.decay_from)
         print(f"nose-first lifetime {args.decay_from:.0f}->140 km, {name}: {p2[name][0][-1]:.1f} d")
 
-    y0, Torb = circ_state(140, 10.0)
+    y0, Torb = circ_state(140, 10.0, incl_deg=args.incl)
     sol = solve_ivp(rhs, (0, 20 * Torb), y0, method="DOP853", rtol=1e-8, atol=ATOL,
                     events=ground_event, max_step=10)
     p3 = sol_diag(sol)
     print(f"reentry: {p3['t'][-1]/60:.1f} min from 140 km, impact {p3['speed'][-1]:.0f} m/s, "
-          f"nose pitch {p3['nose_pitch'][-1]:.1f} deg")
+          f"nose elevation {p3['nose_elev'][-1]:.1f} deg")
 
     fig, ax = plt.subplots(3, 2, figsize=(13, 14))
     plot_density(ax[0, 0], atms)
@@ -714,10 +866,11 @@ def cmd_survey(args):
     cmap = plt.get_cmap("viridis")
     for i, h0 in enumerate(args.alts):
         d, T = p1[h0]
-        a.plot(d["t"] / T, d["aoa"], c=cmap(i / max(1, len(args.alts) - 1)), lw=0.8, label=f"{h0:g} km")
-    a.set_xlabel("orbits"); a.set_ylabel("angle between nose and relative wind (deg)")
-    a.set_title(f"Attitude after release {args.aoa0:g}° off the wind")
-    a.set_yticks(np.arange(-180, 181, 45)); a.legend(fontsize=8); a.grid(alpha=0.3)
+        a.plot(d["t"] / T, d["aoa_total"], c=cmap(i / max(1, len(args.alts) - 1)), lw=0.8, label=f"{h0:g} km")
+    a.set_xlabel("orbits"); a.set_ylabel("total angle, nose vs relative wind (deg)")
+    a.set_title(f"Attitude after release (pitch {args.aoa0:g}°, yaw {args.yaw0:g}°, "
+                f"tip-off {', '.join(f'{x:g}' for x in args.rates0)} °/s)")
+    a.set_ylim(0, 180); a.set_yticks(np.arange(0, 181, 30)); a.legend(fontsize=8); a.grid(alpha=0.3)
     a = ax[1, 1]
     for name, (td, hd) in p2.items():
         a.plot(td, hd, c=SOLAR_COLORS[name], label=f"{solar_label(name)}: {td[-1]:.0f} d")
@@ -734,24 +887,207 @@ def cmd_survey(args):
 
 
 # =============================================================================
+# Subcommand: mc (Monte Carlo over release attitude / tip-off)
+# =============================================================================
+_MC = {}
+
+
+def _mc_init(mass, cant, solar, material):
+    dart = Dart(m=mass, fin_cant_deg=cant)
+    atm = Atmosphere.named(solar)
+    _MC.update(dart=dart, atm=atm, material=material, rhs=make_rhs(dart, atm, material))
+
+
+def _mc_attitude(job):
+    h0, params, n_orbits, n_eval = job
+    y0, Torb = circ_state(h0, **params)
+    T_end = n_orbits * Torb
+    te = np.linspace(0, T_end, n_eval)
+    s = solve_ivp(_MC["rhs"], (0, T_end), y0, method="DOP853", rtol=1e-8, atol=ATOL,
+                  t_eval=te, events=ground_event)
+    d = diagnostics(s.t, s.y)
+    pad = lambda a: np.concatenate([a, np.full(n_eval - len(a), np.nan)])
+    return dict(t=te / Torb, aoa=pad(d["aoa_total"]), roll=pad(d["roll_rate"]), h=pad(d["h"]))
+
+
+def _mc_reentry(job):
+    h0, params = job
+    y0, Torb = circ_state(h0, **params)
+    s = solve_ivp(_MC["rhs"], (0, 20 * Torb), y0, method="DOP853", rtol=1e-8, atol=ATOL,
+                  events=ground_event, max_step=10)
+    d = diagnostics(s.t, s.y)
+    idx = np.unique(np.linspace(0, len(s.t) - 1, min(len(s.t), 3000)).astype(int))
+    props = [state_props(_MC["dart"], _MC["atm"], s.y[:, i], _MC["material"]) for i in idx]
+    qn = np.array([p["q_nose"] for p in props])
+    k = int(np.argmax(qn))
+    r = s.y[I_R, -1]
+    lon_ef = np.degrees(np.arctan2(r[1], r[0]) - WE * s.t[-1])
+    return dict(peak_q=qn[k], h_peak=d["h"][idx[k]], aoa_peak=d["aoa_total"][idx[k]],
+                impact_speed=d["speed"][-1], t_impact=s.t[-1], hit=s.status == 1,
+                lat=d["lat"][-1], lon=(lon_ef + 180) % 360 - 180, fin_left=d["fin_left"][-1],
+                max_roll=np.abs(d["roll_rate"]).max(),
+                prof_h=d["h"][idx], prof_aoa=d["aoa_total"][idx])
+
+
+def mc_params(args, rng, n):
+    """Random release attitudes and tip-off rates."""
+    out = []
+    for _ in range(n):
+        if args.attitude == "random":   # nose uniform on the sphere
+            a, b = rng.uniform(-180, 180), np.degrees(np.arcsin(rng.uniform(-1, 1)))
+        else:
+            a, b = args.aoa0 + rng.normal(0, args.point_sigma), rng.normal(0, args.point_sigma)
+        out.append(dict(aoa0_deg=a, incl_deg=args.incl, yaw0_deg=b, roll0_deg=rng.uniform(0, 360),
+                        rates0_dps=tuple(rng.normal(0, args.tipoff, 3))))
+    return out
+
+
+def cmd_mc(args):
+    import os
+    import warnings
+    from multiprocessing import Pool
+    # samples that reach the ground early are NaN-padded; all-NaN statistics are expected
+    warnings.filterwarnings("ignore", "All-NaN slice", RuntimeWarning)
+    warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
+    rng = np.random.default_rng(args.seed)
+    workers = args.workers or os.cpu_count()
+    init = (args.mass, args.fin_cant, args.solar, args.fin_material)
+    desc = (f"{args.attitude} attitude" + (f" around {args.aoa0:g}° ± {args.point_sigma:g}°"
+                                           if args.attitude == "nominal" else "")
+            + f", tip-off σ {args.tipoff:g} °/s/axis, incl {args.incl:g}°, cant {args.fin_cant:g}°")
+    print(f"Monte Carlo: {args.n} samples per case, {desc}, {workers} workers")
+    save, wall = {}, time.time()
+    with Pool(workers, initializer=_mc_init, initargs=init) as pool:
+        att = {}
+        for h0 in args.alts:
+            jobs = [(h0, p, args.orbits, int(400 * args.orbits)) for p in mc_params(args, rng, args.n)]
+            res = pool.map(_mc_attitude, jobs)
+            att[h0] = res
+            A = np.array([r["aoa"] for r in res])
+            m = np.nanmean(A[:, -(A.shape[1] // max(1, int(args.orbits))):], axis=1)
+            print(f"  {h0:g} km: last-orbit mean total angle median {np.median(m):.0f}°, "
+                  f"{np.mean(m < 30)*100:.0f}% within 30° of the wind; max |roll rate| "
+                  f"{np.nanmax(np.abs([r['roll'] for r in res])):.1f} °/s  ({time.time()-wall:.0f} s)", flush=True)
+            save[f"att_{h0:g}_t"] = res[0]["t"]
+            save[f"att_{h0:g}_aoa"] = A
+            save[f"att_{h0:g}_roll"] = np.array([r["roll"] for r in res])
+        ren = None
+        if args.reentry_from > 0:
+            jobs = [(args.reentry_from, p) for p in mc_params(args, rng, args.n)]
+            ren = pool.map(_mc_reentry, jobs)
+            for key in ("peak_q", "h_peak", "aoa_peak", "impact_speed", "t_impact", "lat", "lon", "fin_left"):
+                save[f"reentry_{key}"] = np.array([r[key] for r in ren])
+            print(f"  reentry from {args.reentry_from:g} km: peak nose flux "
+                  f"{np.median(save['reentry_peak_q'])/1e6:.2f} MW/m² median "
+                  f"({save['reentry_peak_q'].min()/1e6:.2f}–{save['reentry_peak_q'].max()/1e6:.2f}); total angle at "
+                  f"peak heating median {np.median(save['reentry_aoa_peak']):.0f}°, max "
+                  f"{save['reentry_aoa_peak'].max():.0f}°  ({time.time()-wall:.0f} s)", flush=True)
+    np.savez(Path(args.out) / args.file, **save)
+    print(f"saved {Path(args.out) / args.file}")
+
+    # ---- attitude ensembles figure ----
+    if att:
+        nr = len(att)
+        fig, axs = plt.subplots(nr, 2, figsize=(13, 3.6 * nr), squeeze=False,
+                                gridspec_kw=dict(width_ratios=[2.2, 1]))
+        for (h0, res), (a, b) in zip(att.items(), axs):
+            t = res[0]["t"]
+            A = np.array([r["aoa"] for r in res])
+            for row in A[:2]:
+                a.plot(t, row, c="k", lw=0.3, alpha=0.35)
+            # swing envelope: per-sample max over 1/20-orbit windows
+            w = 20
+            nb = A.shape[1] // w
+            Ab = A[:, :nb * w].reshape(len(A), nb, w)
+            tb = t[:nb * w].reshape(nb, w).mean(1)
+            env_hi, env_lo = np.nanmax(Ab, 2), np.nanmin(Ab, 2)
+            a.fill_between(tb, np.nanpercentile(env_hi, 10, 0), np.nanpercentile(env_hi, 90, 0),
+                           color="tab:red", alpha=0.25, label="swing max, 10–90 % of samples")
+            a.plot(tb, np.nanmedian(env_hi, 0), c="tab:red", lw=1.5, label="swing max, median")
+            a.fill_between(tb, np.nanpercentile(env_lo, 10, 0), np.nanpercentile(env_lo, 90, 0),
+                           color="tab:blue", alpha=0.25, label="swing min, 10–90 %")
+            a.plot(tb, np.nanmedian(env_lo, 0), c="tab:blue", lw=1.5, label="swing min, median")
+            a.set_ylim(0, 180); a.set_yticks(np.arange(0, 181, 30)); a.grid(alpha=0.3)
+            a.set_xlabel("orbits since release"); a.set_ylabel("total angle, nose vs wind (°)")
+            a.set_title(f"Released at {h0:g} km — {len(res)} samples (thin black: two raw traces)", fontsize=10)
+            a.legend(fontsize=7, loc="upper right", ncol=2)
+            n_last = len(t) // max(1, int(args.orbits))
+            m = np.nanmean(A[:, -n_last:], axis=1)
+            b.hist(m, bins=np.arange(0, 181, 10), color="tab:blue", alpha=0.7)
+            b.set_xlim(0, 180); b.set_xticks(np.arange(0, 181, 30))
+            b.set_xlabel("mean total angle over the last orbit (°)"); b.set_ylabel("samples")
+            R_ = np.array([r["roll"] for r in res])
+            b.text(0.97, 0.95, f"{np.mean(m < 30)*100:.0f}% within 30°\nmax |roll rate| "
+                   f"{np.nanmax(np.abs(R_)):.1f} °/s", transform=b.transAxes, ha="right", va="top", fontsize=9,
+                   bbox=dict(fc="w", ec="0.7"))
+            b.grid(alpha=0.3)
+        fig.suptitle(f"Attitude Monte Carlo — {args.mass*1e3:.0f} g dart, {desc}\n({solar_label(args.solar)})",
+                     fontsize=12)
+        fig.tight_layout()
+        out = Path(args.out) / "mc_attitude.png"
+        fig.savefig(out, dpi=130); print(f"saved {out}")
+
+    # ---- reentry ensemble figure ----
+    if ren:
+        fig, ax = plt.subplots(2, 2, figsize=(13, 10))
+        a = ax[0, 0]
+        for r in ren:
+            a.plot(r["prof_aoa"], r["prof_h"], c="k", lw=0.25, alpha=0.2)
+        a.set_xlim(0, 180); a.set_ylim(0, args.reentry_from); a.grid(alpha=0.3)
+        a.set_xlabel("total angle, nose vs wind (°)"); a.set_ylabel("altitude (km)")
+        a.set_title(f"Reentries from {args.reentry_from:g} km: attitude vs altitude")
+        a = ax[0, 1]
+        sc = a.scatter([r["aoa_peak"] for r in ren], [r["peak_q"] / 1e6 for r in ren],
+                       c=[r["h_peak"] for r in ren], cmap="viridis")
+        fig.colorbar(sc, ax=a, label="altitude of peak heating (km)")
+        a.set_xlabel("total angle at peak nose heating (°)"); a.set_ylabel("peak nose heat flux (MW/m²)")
+        a.set_title("Peak nose heating"); a.grid(alpha=0.3)
+        a = ax[1, 0]
+        lat, lon = np.array([r["lat"] for r in ren]), np.array([r["lon"] for r in ren])
+        north = (lat - lat.mean()) * np.pi / 180 * RE / 1e3
+        east = ((lon - lon.mean() + 180) % 360 - 180) * np.pi / 180 * RE / 1e3 * np.cos(np.radians(lat.mean()))
+        a.scatter(east, north, c="tab:red", s=18)
+        a.set_aspect("equal", adjustable="datalim"); a.grid(alpha=0.3)
+        a.set_xlabel("east of mean impact (km)"); a.set_ylabel("north of mean impact (km)")
+        a.set_title(f"Impact footprint (mean {lat.mean():.1f}°, {lon.mean():.1f}°; Earth-fixed)")
+        a = ax[1, 1]
+        a.hist([r["impact_speed"] for r in ren], bins=15, color="tab:blue", alpha=0.7)
+        a.set_xlabel("impact speed (m/s)"); a.set_ylabel("samples"); a.grid(alpha=0.3)
+        tt = np.array([r["t_impact"] for r in ren]) / 60
+        fl = np.array([r["fin_left"] for r in ren]) * 100
+        a.set_title(f"Impact speed  (time to impact {tt.min():.1f}–{tt.max():.1f} min; "
+                    f"fin left {fl.min():.0f}–{fl.max():.0f} %)", fontsize=10)
+        fig.suptitle(f"Reentry Monte Carlo — {args.mass*1e3:.0f} g dart, {args.fin_material} fins, {desc}",
+                     fontsize=12)
+        fig.tight_layout()
+        out = Path(args.out) / "mc_reentry.png"
+        fig.savefig(out, dpi=130); print(f"saved {out}")
+
+
+# =============================================================================
 # Subcommand: run (continuous release -> ground)
 # =============================================================================
 def cmd_run(args):
-    dart = Dart(m=args.mass)
+    dart = Dart(m=args.mass, fin_cant_deg=args.fin_cant)
     atm = Atmosphere.named(args.solar)
     rhs = make_rhs(dart, atm, args.fin_material)
-    y, _ = circ_state(args.release_alt, args.aoa0)
+    y, _ = circ_state(args.release_alt, args.aoa0, **release_kwargs(args))
     print(f"fins: {MATERIALS[args.fin_material]['label']}, {dart.fin_mass(args.fin_material)*1e3:.0f} g "
-          f"(vehicle mass held at {dart.m*1e3:.0f} g)")
+          f"(vehicle mass held at {dart.m*1e3:.0f} g); incl {args.incl:g}°, pitch {args.aoa0:g}°, "
+          f"yaw {args.yaw0:g}°, roll {args.roll0:g}°, tip-off {args.rates0} °/s, cant {args.fin_cant:g}°")
     T_all, Y_all = [0.0], [np.array(y)]
     t0, chunk, wall = 0.0, 86400.0, time.time()
     while True:
         s = solve_ivp(rhs, (t0, t0 + chunk), y, method="DOP853", rtol=1e-8, atol=ATOL, events=ground_event)
         T_all.extend(s.t[1:]); Y_all.extend(s.y[:, 1:].T)
-        y, t0 = s.y[:, -1], s.t[-1]
-        h = (np.hypot(y[0], y[1]) - RE) / 1e3
-        print(f"day {t0/86400:7.2f}  alt {h:7.2f} km  fin {y[6]:6.0f} K  fin left {100*(1-min(y[7],1)):5.1f}%  "
-              f"steps {len(T_all)}  wall {time.time()-wall:6.0f}s", flush=True)
+        y, t0 = s.y[:, -1].copy(), s.t[-1]
+        y[I_Q] /= np.linalg.norm(y[I_Q])
+        d = diagnostics(np.array([t0]), y[:, None])
+        print(f"day {t0/86400:7.2f}  alt {d['h'][0]:7.2f} km  aoa {d['aoa_total'][0]:5.1f}°  "
+              f"roll {d['roll_rate'][0]:8.2f} °/s  fin {y[I_TF]:6.0f} K  "
+              f"fin left {100*(1-min(y[I_F],1)):5.1f}%  steps {len(T_all)}  wall {time.time()-wall:6.0f}s",
+              flush=True)
+        h = d["h"][0]
         if s.status == 1:
             break
         if h < 160:
@@ -762,7 +1098,8 @@ def cmd_run(args):
     out = Path(args.out) / args.file
     np.savez(out, t=np.array(T_all), y=np.array(Y_all).T, mass=dart.m,
              release_alt=args.release_alt, aoa0=args.aoa0, solar=args.solar,
-             material=args.fin_material)
+             material=args.fin_material, incl=args.incl, yaw0=args.yaw0, roll0=args.roll0,
+             rates0=np.asarray(args.rates0, float), fin_cant=args.fin_cant)
     print(f"saved {out}")
 
 
@@ -774,12 +1111,18 @@ class Run:
         meta = lambda k, default: D[k] if k in D.files else default  # older files lack metadata
         self.t = D["t"]
         y = D["y"]
-        if y.shape[0] == 6:   # pre-heating run file: assume intact fins
-            y = np.vstack([y, np.full(len(self.t), T_ENV), np.zeros(len(self.t))])
+        if y.shape[0] in (6, 8):   # planar (v1) run file
+            print("note: planar (v1) run file; converted to 6-DOF states")
+            y = planar_to_6dof(y)
         self.y = y
-        self.dart = Dart(m=float(D["mass"]))
+        self.fin_cant = float(meta("fin_cant", 0.0))
+        self.dart = Dart(m=float(D["mass"]), fin_cant_deg=self.fin_cant)
         self.rel_alt = float(meta("release_alt", 500.0))
         self.aoa0 = float(meta("aoa0", 90.0))
+        self.yaw0 = float(meta("yaw0", 0.0))
+        self.roll0 = float(meta("roll0", 0.0))
+        self.rates0 = np.asarray(meta("rates0", np.zeros(3)), float)
+        self.incl = float(meta("incl", 0.0))
         self.solar = str(meta("solar", "moderate"))
         self.material = str(meta("material", "balsa"))
         self.atms = {k: Atmosphere.named(k) for k in SOLAR}
@@ -788,6 +1131,19 @@ class Run:
         self.full = diagnostics(self.t, self.y)
         self.h = self.full["h"]
         self.T_rel = 2 * np.pi * np.sqrt((RE + self.rel_alt * 1e3) ** 3 / MU)
+
+    def release_label(self):
+        p = f"{self.aoa0:+g}° pitch"
+        if self.yaw0:
+            p += f", {self.yaw0:+g}° yaw"
+        if self.roll0:
+            p += f", {self.roll0:+g}° roll"
+        if np.any(self.rates0):
+            p += f", tip-off ({', '.join(f'{x:g}' for x in self.rates0)}) °/s"
+        p += f", incl {self.incl:g}°"
+        if self.fin_cant:
+            p += f", fin cant {self.fin_cant:g}°"
+        return p
 
     def t_at_alt(self, a):
         i = int(np.argmax(self.h <= a))
@@ -824,7 +1180,7 @@ def trajectory_heating(R, h_max=200.0, max_points=None):
         sel = sel[np.linspace(0, len(sel) - 1, max_points).astype(int)]
     rows = [state_props(R.dart, R.atm, R.y[:, i], R.material) for i in sel]
     out = {k: np.array([r[k] for r in rows]) for k in rows[0]}
-    out.update(t=R.t[sel], h=R.h[sel], T_fin=R.y[6, sel], fin_left=1 - np.clip(R.y[7, sel], 0, 1))
+    out.update(t=R.t[sel], h=R.h[sel], T_fin=R.y[I_TF, sel], fin_left=1 - np.clip(R.y[I_F, sel], 0, 1))
     # fin heating per unit remaining fraction, for material replays
     out["P_fins_unit"] = out["P_fins"] / np.maximum(out["fin_left"], 1e-6)
     return out
@@ -954,11 +1310,16 @@ def cmd_plot(args):
                       t_eval=np.linspace(0, W, 4000), events=ground_event)
         d = sol_diag(s)
         x = d["t"] / Trel if unit == "orbit" else d["t"]
-        ax.plot(x, d["aoa"], c="k", lw=0.9, label="nose vs relative wind")
-        ax.plot(x, d["nose_pitch"], c="tab:blue", lw=0.8, ls="--", alpha=0.8, label="nose vs local horizon")
+        ax.plot(x, d["aoa_total"], c="k", lw=0.9, label="total angle, nose vs relative wind")
+        ax.plot(x, d["nose_elev"], c="tab:blue", lw=0.8, ls="--", alpha=0.8, label="nose elevation vs horizon")
+        ax.plot(x, d["beta"], c="tab:red", lw=0.7, alpha=0.8, label="out-of-plane (sideslip) angle")
         for yv, c in ((-90, "tab:green"), (90, "tab:green"), (0, "gray")):
             ax.axhline(yv, c=c, lw=0.6, ls=":" if yv else "-")
-        ax.set_ylim(-185, 185); ax.set_yticks(np.arange(-180, 181, 45))
+        ax.set_ylim(-95, 185); ax.set_yticks(np.arange(-90, 181, 45))
+        tw = ax.twinx()
+        tw.plot(x, d["roll_rate"], c="tab:purple", lw=0.6, alpha=0.6)
+        tw.set_ylabel("roll rate (°/s)", color="tab:purple", fontsize=8)
+        tw.tick_params(axis="y", colors="tab:purple", labelsize=7)
         ax.set_xlabel("orbits since window start" if unit == "orbit" else "seconds since window start")
         ax.set_ylabel("degrees")
         when = "release (day 0)" if h0 == rel_alt else f"day {t[i]/86400:.1f}"
@@ -966,10 +1327,11 @@ def cmd_plot(args):
         ax.grid(alpha=0.3)
     for ax in axs.flat[len(targets):]:
         ax.set_visible(False)
-    axs[0, 0].text(0.02, 0.04, "−90 = nadir, +90 = zenith (nose vs horizon)\n0 = nose into the wind",
+    axs[0, 0].text(0.02, 0.04, "elevation: −90 = nadir, +90 = zenith\ntotal angle: 0 = nose into the wind\n"
+                   "purple (right axis): roll rate",
                    transform=axs[0, 0].transAxes, fontsize=8, va="bottom", bbox=dict(fc="w", ec="0.8"))
     axs[0, 0].legend(fontsize=8, loc="upper right")
-    fig.suptitle(f"{dart.m*1000:.0f} g dart released at {rel_alt:g} km ({aoa0:+g}° from the wind) — "
+    fig.suptitle(f"{dart.m*1000:.0f} g dart released at {rel_alt:g} km ({R.release_label()}) — "
                  f"attitude snapshots on the way down\n({solar_label(solar)}, {R.material} fins)", fontsize=12)
     fig.tight_layout()
     out = Path(args.out) / "attitude_windows.png"
@@ -985,9 +1347,9 @@ def cmd_plot(args):
                    mark_alt=rel_alt)
     a = ax[1, 0]
     step = max(1, len(t) // 300000)
-    a.scatter(np.abs(full["aoa"][::step]), h[::step], s=0.3, c="k", alpha=0.25, rasterized=True)
+    a.scatter(full["aoa_total"][::step], h[::step], s=0.3, c="k", alpha=0.25, rasterized=True)
     a.set_xlim(0, 180); a.set_ylim(0, rel_alt + 10); a.set_xticks(np.arange(0, 181, 30))
-    a.set_xlabel("|angle between nose and relative wind| (deg)"); a.set_ylabel("altitude (km)")
+    a.set_xlabel("total angle between nose and relative wind (deg)"); a.set_ylabel("altitude (km)")
     a.set_title("Whole life, release → ground: the swing\nshrinks as the air thickens"); a.grid(alpha=0.3)
     a = ax[1, 1]
     for name, (td, hd) in p2.items():
@@ -1002,12 +1364,12 @@ def cmd_plot(args):
     plot_reentry(ax[2, 0], ax[2, 1], {kk: v[m] for kk, v in full.items()},
                  "Final descent below 150 km:\nnose attitude vs flight path",
                  "Final descent: speed and angle of attack")
-    footer(fig, dart, f"Released at {rel_alt:g} km, {aoa0:+g}° from the wind, rotating with the local vertical.")
+    footer(fig, dart, f"Released at {rel_alt:g} km ({R.release_label()}), rotating with the local vertical.")
     fig.tight_layout(rect=[0, 0.02, 1, 1])
     out = Path(args.out) / "overview.png"
     fig.savefig(out, dpi=130); print(f"saved {out}")
     print(f"crossover ~{k['crossover']:.0f} km; impact {full['speed'][-1]:.0f} m/s, "
-          f"final nose pitch {full['nose_pitch'][-1]:.1f} deg")
+          f"final nose elevation {full['nose_elev'][-1]:.1f} deg")
 
     # ---- heating ----
     H = trajectory_heating(R, 200.0)
@@ -1020,11 +1382,67 @@ def cmd_plot(args):
 def attitude_period(R, y):
     rho, n, T, v_b = local_state(R.dart, R.atm, y)
     d = np.radians(1.0)
-    f = float(np.clip(y[7], 0, 1))
-    tp = aero(R.dart, rot(-d) @ v_b, 0.0, rho, n, T, 1 - f)[1]
-    tm = aero(R.dart, rot(d) @ v_b, 0.0, rho, n, T, 1 - f)[1]
+    f = float(np.clip(y[I_F], 0, 1))
+    w0 = np.zeros(3)
+    tp = aero(R.dart, rot(-d) @ v_b, w0, rho, n, T, 1 - f)[1][2]
+    tm = aero(R.dart, rot(d) @ v_b, w0, rho, n, T, 1 - f)[1][2]
     k = -(tp - tm) / (2 * d)
     return 2 * np.pi * np.sqrt(R.dart.I_t / k) if k > 0 else R.T_rel / 4
+
+
+def view_frame(y):
+    """Local frame for drawing one state: up, horizontal wind heading, left
+    side, and the body -> inertial matrix."""
+    r = y[I_R]
+    up = r / np.linalg.norm(r)
+    v_rel = y[I_V] - np.cross(EARTH_W, r)
+    e_h = v_rel - (v_rel @ up) * up
+    e_h = e_h / np.linalg.norm(e_h) if np.linalg.norm(e_h) > 1e-9 else np.cross(up, [0, 0, 1.0])
+    return up, e_h, np.cross(up, e_h), quat_dcm(y[I_Q])
+
+
+def dart_silhouette(dart, C, ex, ey, left):
+    """Orthographic projection of the dart onto the plane (ex right, ey up).
+    Returns body and cone polygons, [(fin polygon, depth)], and tip point."""
+    ez = np.cross(ex, ey)
+    P = np.vstack([ex, ey]) @ C                    # body coords -> view 2D
+    ax2 = P[:, 0]
+    L = np.linalg.norm(ax2)
+    perp = np.array([-ax2[1], ax2[0]]) / L if L > 1e-6 else np.array([0.0, 1.0])
+    x_sh = dart.x_tip - dart.Lc
+    tail, sh, tip = ax2 * dart.x_tail, ax2 * x_sh, ax2 * dart.x_tip
+    rp = dart.r * perp
+    body = np.array([tail + rp, sh + rp, sh - rp, tail - rp])
+    cone = np.array([sh + rp, tip, sh - rp])
+    fins = []
+    s, c = dart.fin_span * left, dart.fin_chord
+    for e in dart.fin_e:
+        pts = [np.array([dart.x_tail + dx, 0, 0]) + rr * e
+               for dx, rr in ((0, dart.r), (c, dart.r), (c, dart.r + s), (0, dart.r + s))]
+        ctr = np.array([dart.x_tail + c / 2, 0, 0]) + (dart.r + s / 2) * e
+        fins.append((np.array([P @ p for p in pts]), float(ez @ (C @ ctr))))
+    return body, cone, fins, tip
+
+
+class DartArtist:
+    """Patches for one projected view of the dart."""
+
+    def __init__(self, ax, body_c="#c9ced8", tip_r=0.008):
+        self.body = Polygon(np.zeros((4, 2)), fc=body_c, ec="k", zorder=3); ax.add_patch(self.body)
+        self.cone = Polygon(np.zeros((3, 2)), fc=body_c, ec="k", zorder=3); ax.add_patch(self.cone)
+        self.fins = [Polygon(np.zeros((4, 2)), ec="k", zorder=2) for _ in range(4)]
+        for p in self.fins:
+            ax.add_patch(p)
+        self.tip = Circle((0, 0), tip_r, ec="none", zorder=4); ax.add_patch(self.tip)
+
+    def update(self, dart, C, ex, ey, left, fin_color, tip_color):
+        body, cone, fins, tip = dart_silhouette(dart, C, ex, ey, left)
+        self.body.set_xy(body); self.cone.set_xy(cone)
+        for p, (xy, depth) in zip(self.fins, fins):
+            p.set_xy(xy); p.set_facecolor(fin_color); p.set_visible(left > 0.005)
+            p.set_zorder(3.5 if depth > 0 else 2)
+        self.tip.center = tip; self.tip.set_facecolor(tip_color)
+        return tip
 
 
 def video_timeline(R, fps, dwell_s, ff_s):
@@ -1110,9 +1528,9 @@ def cmd_video(args):
         ax.xaxis.label.set_color(txtc); ax.yaxis.label.set_color(txtc); ax.title.set_color(txtc)
         ax.grid(alpha=0.15)
 
-    title = fig.text(0.02, 0.955, f"VLEO dart — {dart.m*1e3:.0f} g, {dart.fin_t*1e3:.0f} mm {R.material} fins, "
-                     f"released {R.rel_alt:g} km {'nadir' if abs(R.aoa0-90)<1 else f'{R.aoa0:+g}°'}-pointing",
-                     color=txtc, fontsize=16, weight="bold")
+    title = fig.text(0.02, 0.955, f"VLEO dart (6-DOF) — {dart.m*1e3:.0f} g, {dart.fin_t*1e3:.0f} mm {R.material} "
+                     f"fins, released {R.rel_alt:g} km", color=txtc, fontsize=16, weight="bold")
+    fig.text(0.02, 0.928, f"release: {R.release_label()}", color="#8899bb", fontsize=10)
     met = fig.text(0.50, 0.955, "", color=txtc, fontsize=16, family="monospace", ha="center")
     phase = fig.text(0.98, 0.955, "", color="#ffd166", fontsize=16, ha="right", weight="bold")
 
@@ -1123,24 +1541,28 @@ def cmd_video(args):
     for sp in axd.spines.values():
         sp.set_color("#55607a")
     axd.axhline(0, c="#8899bb", lw=0.8, ls="--", alpha=0.6)
-    axd.text(-0.41, 0.006, "local horizon (prograde →)", color="#8899bb", fontsize=9, ha="left", va="bottom")
+    axd.text(-0.41, 0.006, "local horizon (wind heading →)", color="#8899bb", fontsize=9, ha="left", va="bottom")
+    axd.text(-0.41, -0.012, "side view, looking from the right of the flight direction",
+             color="#8899bb", fontsize=8, ha="left", va="top")
     axd.annotate("Earth (nadir)", (-0.37, -0.31), (-0.37, -0.20), color="#8899bb", fontsize=9, ha="center",
                  arrowprops=dict(arrowstyle="->", color="#8899bb"))
     axd.plot([0.25, 0.35], [-0.29, -0.29], c=txtc, lw=2); axd.text(0.30, -0.282, "10 cm", color=txtc, ha="center", fontsize=9)
     glow = Circle((0, 0), 0.05, fc="#ff7b00", ec="none", alpha=0.0, zorder=1)
     glow2 = Circle((0, 0), 0.02, fc="#ffe7a0", ec="none", alpha=0.0, zorder=1)
     axd.add_patch(glow); axd.add_patch(glow2)
-    x_tip, x_tail, r, Lc = dart.x_tip, dart.x_tail, dart.r, dart.Lc
-    x_sh = x_tip - Lc
-    body_xy = np.array([[x_tail, r], [x_sh, r], [x_sh, -r], [x_tail, -r]])
-    cone_xy = np.array([[x_sh, r], [x_tip, 0], [x_sh, -r]])
-    body = Polygon(body_xy, fc="#c9ced8", ec="k", zorder=3); axd.add_patch(body)
-    cone = Polygon(cone_xy, fc="#c9ced8", ec="k", zorder=3); axd.add_patch(cone)
-    fins = [Polygon(np.zeros((4, 2)), ec="k", zorder=2) for _ in range(2)]
-    for p in fins:
-        axd.add_patch(p)
-    tip = Circle((x_tip, 0), 0.008, ec="none", zorder=4); axd.add_patch(tip)
+    side = DartArtist(axd)
     cg = axd.plot([0], [0], marker="o", ms=7, mfc="w", mec="k", zorder=5)[0]
+    # top-view inset (looking down; wind heading to the right, left side up)
+    axt = fig.add_axes([0.355, 0.705, 0.12, 0.2])
+    axt.set_xlim(-0.36, 0.36); axt.set_ylim(-0.36, 0.36); axt.set_aspect("equal")
+    axt.set_xticks([]); axt.set_yticks([]); axt.set_facecolor("#0b0f1a")
+    for sp in axt.spines.values():
+        sp.set_color("#55607a")
+    axt.set_title("top view", color="#8899bb", fontsize=9, pad=3)
+    axt.annotate("", (0.34, -0.3), (0.18, -0.3), arrowprops=dict(arrowstyle="-|>", color="#4cc9f0", lw=1.5))
+    axt.text(0.26, -0.27, "wind heading", color="#4cc9f0", fontsize=7, ha="center")
+    top = DartArtist(axt, tip_r=0.012)
+    axt.plot([0], [0], marker="o", ms=4, mfc="w", mec="k", zorder=5)
     wind = axd.annotate("", (0, 0), (0, 0), arrowprops=dict(arrowstyle="-|>", color="#4cc9f0", lw=2.5), zorder=6)
     wind_lbl = axd.text(0, 0, "relative wind", color="#4cc9f0", fontsize=10, ha="center")
     regime_lbl = axd.text(-0.41, 0.30, "", color=txtc, fontsize=11, va="top")
@@ -1191,7 +1613,7 @@ def cmd_video(args):
     m3.set_ylim(0, 160); m3.set_xlabel("temperature (°C)"); m3.set_ylabel("altitude (km)")
     m3.legend(fontsize=8, facecolor="#111827", labelcolor=txtc, loc="upper right")
     mk3 = m3.plot([], [], "o", c="#ffd166", ms=7)[0]; mk3b = m3.plot([], [], "o", c="#ef476f", ms=7)[0]
-    fig.text(0.5, 0.008, "Rough model: planar equatorial orbit, pitch only; NRLMSIS 2.0; Sentman free-molecular + "
+    fig.text(0.5, 0.008, "Rough model: 6-DOF rigid body; NRLMSIS 2.0; Sentman free-molecular + "
              "Barrowman-style continuum aero; Sutton-Graves heating; lumped fins. Dart drawn to scale.",
              color="#8899bb", fontsize=9, ha="center")
 
@@ -1206,19 +1628,11 @@ def cmd_video(args):
     wall = time.time()
     for k, (tt, label, rate) in enumerate(frames):
         y, p = Ys[:, k], props[k]
-        hk, Tf, left = diag["h"][k], y[6], 1 - float(np.clip(y[7], 0, 1))
-        pitch = np.radians(diag["nose_pitch"][k])
-        Rm = rot(pitch)[:2, :2]
-        tr = lambda xy: xy @ Rm.T
-        body.set_xy(tr(body_xy)); cone.set_xy(tr(cone_xy))
-        sp = dart.fin_span * left
-        fc = hot(Tf, fin_base)
-        for p_, s_ in zip(fins, (1, -1)):
-            p_.set_xy(tr(np.array([[x_tail, s_*r], [x_tail + dart.fin_chord, s_*r],
-                                   [x_tail + dart.fin_chord, s_*(r + sp)], [x_tail, s_*(r + sp)]])))
-            p_.set_facecolor(fc); p_.set_visible(left > 0.005)
-        tip_xy = tr(np.array([[x_tip, 0.0]]))[0]
-        tip.center = tip_xy; tip.set_facecolor(hot(p["T_nose_eq"], "#c9ced8"))
+        hk, Tf, left = diag["h"][k], y[I_TF], 1 - float(np.clip(y[I_F], 0, 1))
+        up, e_h, e_side, Cb = view_frame(y)
+        fc, tc = hot(Tf, fin_base), hot(p["T_nose_eq"], "#c9ced8")
+        tip_xy = side.update(dart, Cb, e_h, up, left, fc, tc)
+        top.update(dart, Cb, e_h, e_side, left, fc, tc)
         lq = np.log10(max(p["q_nose"], 1.0))
         a = float(np.clip((lq - 4.0) / 3.5, 0, 1))
         glow.center = glow2.center = tip_xy
@@ -1244,9 +1658,12 @@ def cmd_video(args):
         ind.set_text(
             f"Altitude            {hk:9.2f} km\n"
             f"Speed (rel. air)    {diag['speed'][k]:9.0f} m/s    Mach {p['mach']:5.1f}\n"
+            f"Latitude            {diag['lat'][k]:9.1f}°\n"
             f"Flight path angle   {diag['fpa'][k]:9.1f}°\n"
-            f"Nose vs wind (AoA)  {diag['aoa'][k]:9.1f}°\n"
-            f"Nose vs horizon     {diag['nose_pitch'][k]:9.1f}°\n"
+            f"Nose vs wind, total {diag['aoa_total'][k]:9.1f}°   (pitch {diag['aoa'][k]:+.0f}°, "
+            f"side {diag['beta'][k]:+.0f}°)\n"
+            f"Nose elevation      {diag['nose_elev'][k]:9.1f}°\n"
+            f"Roll rate           {diag['roll_rate'][k]:9.1f} °/s\n"
             f"Air density         {p['rho']:9.2e} kg/m³\n"
             f"Dynamic pressure    {p['qdyn']:9.3g} Pa\n"
             f"Knudsen number      {p['Kn']:9.3g}   ({regime(p['Kn'])})\n"
@@ -1281,13 +1698,27 @@ def main():
     p.add_argument("--out", default=".", help="output directory (default: .)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def orbit_opts(sp, attitude=True):
+        sp.add_argument("--incl", type=float, default=51.6, help="orbit inclination, deg (default 51.6)")
+        sp.add_argument("--fin-cant", type=float, default=0.0,
+                        help="fin cant (misalignment) angle, deg; drives roll (default 0)")
+        if attitude:
+            sp.add_argument("--yaw0", type=float, default=0.0,
+                            help="initial out-of-plane nose angle toward the orbit normal, deg (default 0)")
+            sp.add_argument("--roll0", type=float, default=0.0, help="initial roll about the nose, deg (default 0)")
+            sp.add_argument("--rates0", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=("P", "Q", "R"),
+                            help="body tip-off rates (roll, pitch, yaw), deg/s, on top of following the "
+                                 "local vertical (default 0 0 0)")
+
     def common(sp, release=True):
         sp.add_argument("--mass", type=float, default=0.1, help="dart mass, kg (default 0.1)")
         sp.add_argument("--solar", choices=list(SOLAR), default="moderate", help="solar activity level")
         if release:
             sp.add_argument("--release-alt", type=float, default=500.0, help="release altitude, km (default 500)")
             sp.add_argument("--aoa0", type=float, default=90.0,
-                            help="initial nose angle from the wind, deg: 90 = nadir, -90 = zenith, 0 = prograde")
+                            help="initial in-plane nose angle from the local horizontal, deg: "
+                                 "90 = nadir, -90 = zenith, 0 = prograde")
+            orbit_opts(sp)
         sp.add_argument("--file", default="continuous_run.npz", help="run data file (default continuous_run.npz)")
         sp.add_argument("--fin-material", choices=list(MATERIALS), default="balsa",
                         help="fin material (default balsa; the only one light enough for a 100 g dart)")
@@ -1300,11 +1731,34 @@ def main():
     sp.add_argument("--mass", type=float, default=0.1)
     sp.add_argument("--solar", choices=list(SOLAR), default="moderate")
     sp.add_argument("--alts", type=float, nargs="+", default=[300, 500, 700], help="altitudes for attitude runs, km")
-    sp.add_argument("--aoa0", type=float, default=30.0, help="initial nose angle from the wind, deg")
+    sp.add_argument("--aoa0", type=float, default=30.0, help="initial in-plane nose angle from the wind, deg")
+    orbit_opts(sp)
     sp.add_argument("--orbits", type=float, default=6, help="orbits per attitude run")
     sp.add_argument("--decay-from", type=float, default=300.0, help="start altitude for lifetime curves, km")
     sp.add_argument("--fin-material", choices=list(MATERIALS), default="fr4")
     sp.set_defaults(func=cmd_survey)
+
+    sp = sub.add_parser("mc", help="Monte Carlo over release attitude and tip-off rates")
+    sp.add_argument("--mass", type=float, default=0.1)
+    sp.add_argument("--solar", choices=list(SOLAR), default="moderate")
+    sp.add_argument("--fin-material", choices=list(MATERIALS), default="balsa")
+    orbit_opts(sp, attitude=False)
+    sp.add_argument("--alts", type=float, nargs="*", default=[500, 300, 200],
+                    help="starting altitudes for the attitude ensembles, km (default 500 300 200)")
+    sp.add_argument("--orbits", type=float, default=3, help="orbits per attitude sample (default 3)")
+    sp.add_argument("--n", type=int, default=24, help="samples per altitude (default 24)")
+    sp.add_argument("--attitude", choices=["random", "nominal"], default="random",
+                    help="random: nose direction uniform on the sphere, random roll; nominal: --aoa0 "
+                         "with --point-sigma scatter in pitch and yaw, random roll (default random)")
+    sp.add_argument("--aoa0", type=float, default=90.0, help="nominal in-plane nose angle for --attitude nominal")
+    sp.add_argument("--point-sigma", type=float, default=10.0, help="pointing scatter (1 sigma), deg")
+    sp.add_argument("--tipoff", type=float, default=2.0, help="tip-off rate scatter per axis (1 sigma), deg/s")
+    sp.add_argument("--reentry-from", type=float, default=0.0,
+                    help="also run --n reentries from this altitude to the ground (0 = skip; e.g. 130)")
+    sp.add_argument("--seed", type=int, default=1)
+    sp.add_argument("--workers", type=int, default=0, help="parallel processes (default: all cores)")
+    sp.add_argument("--file", default="mc_results.npz")
+    sp.set_defaults(func=cmd_mc)
 
     sp = sub.add_parser("run", help="continuous run from release to the ground")
     common(sp)
